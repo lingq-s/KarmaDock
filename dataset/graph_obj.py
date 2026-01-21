@@ -32,6 +32,13 @@ from utils.post_processing import mmff_func
 
 print = partial(print, flush=True)
    
+def file2conformer_v2(sdf_file):
+    """读取SDF中所有有效分子，保留容错逻辑"""
+    try:
+        mols = [mol for mol in Chem.SDMolSupplier(sdf_file) if mol is not None]
+        return mols if mols else None
+    except:
+        return None
 
 class PDBBindGraphDataset(Dataset):
 
@@ -170,6 +177,45 @@ class PDBBindGraphDataset(Dataset):
             except:
                 print(f'{pdb_id} error')
                 return None
+
+#    def _single_process(self, idx, return_graph=False, save_file=False):
+#        pdb_id = self.pdb_ids[idx]
+#        dst_file = f'{self.dst_dir}/{pdb_id}.dgl'
+#        try:
+#            # 打印当前处理的复合物ID
+#            print(f"\nProcessing {pdb_id}...")
+#        
+#            # 检查输入文件是否存在
+#            pocket_pdb = f'{self.src_dir}/{pdb_id}/{pdb_id}_pocket_ligH12A.pdb'
+#            ligand_sdf = f'{self.src_dir}/{pdb_id}/{pdb_id}_ligand.sdf'
+#            if not os.path.exists(pocket_pdb):
+#                raise FileNotFoundError(f"PDB文件不存在: {pocket_pdb}")
+#            if not os.path.exists(ligand_sdf):
+#                raise FileNotFoundError(f"SDF文件不存在: {ligand_sdf}")
+#
+#            # 生成图数据
+#            data = get_graph_v1(pocket_pdb=pocket_pdb,
+#                              ligand_crystal_sdf=ligand_sdf)
+#        
+#            # 打印图数据基本信息
+#            print(f"图生成成功 - 节点数: {data['protein'].xyz.shape[0]} (蛋白), {data['ligand'].xyz.shape[0]} (配体)")
+#        
+#            if save_file:
+#                print(f"保存到 {dst_file}")
+#                save_graph(dst_file, data)
+#                # 验证文件是否已生成
+#                if not os.path.exists(dst_file):
+#                    raise RuntimeError("文件保存失败: 目标文件未创建")
+#       
+#            return data if return_graph else None
+
+#        except Exception as e:
+#            print(f"\n❌ {pdb_id} 处理失败: {str(e)}", file=sys.stderr)
+#            import traceback
+#            traceback.print_exc()  # 打印完整调用栈
+#            return None
+
+    
 
     def __getitem__(self, idx):
         if self.on_the_fly == True:
@@ -467,8 +513,10 @@ class VSTestGraphDataset_Fly_SDFMOL2_Refined(VSTestGraphDataset_Fly):
     
 class VSTestGraphDataset_Fly_SDFMOL2(VSTestGraphDataset_Fly_SDFMOL2_Refined):
     '''generating the ligand conformation initialized by rdkit EDGKT with mols from SDF/MOL2 files'''
-    def __init__(self, protein_file, ligand_path, pocket_center, geometric_pos_init=True, use_rdkit_pos=True):
-        super().__init__(protein_file, ligand_path, pocket_center, geometric_pos_init, use_rdkit_pos)
+#    def __init__(self, protein_file, ligand_path, pocket_center, geometric_pos_init=True, use_rdkit_pos=True):
+    def __init__(self, protein_file, ligand_path, pocket_center):
+#        super().__init__(protein_file, ligand_path, pocket_center, geometric_pos_init, use_rdkit_pos)
+        super().__init__(protein_file, ligand_path, pocket_center)
         self.ligand_names = [i.split('.')[0] for i in os.listdir(ligand_path)]
     
     def _single_process(self, idx):
@@ -483,7 +531,105 @@ class VSTestGraphDataset_Fly_SDFMOL2(VSTestGraphDataset_Fly_SDFMOL2_Refined):
         data['ligand'].pos = data['ligand'].xyz + data.pocket_center - data['ligand'].xyz.mean(dim=0)
         data['ligand'].xyz = torch.from_numpy(l_xyz).to(torch.float32)
         return data
+
+class MultiSDFDataset(VSTestGraphDataset_Fly_SDFMOL2):
+    def __init__(self, protein_file, sdf_path, pocket_center, graph_dir=None, optimize_conformer=False):
+        # 0. 先初始化父类（避免覆盖我们的数据）
+        super(VSTestGraphDataset_Fly_SDFMOL2_Refined, self).__init__(
+            protein_file=protein_file,
+            ligand_path=sdf_path,
+            pocket_center=pocket_center
+        )
+        
+        # 1. 读取分子数据（父类初始化后再处理）
+        supplier = Chem.SDMolSupplier(sdf_path)
+        self._mols = [mol for mol in supplier if mol is not None]  # 使用保护属性
+        
+        if not self._mols:
+            raise ValueError("错误：SDF文件中未发现有效分子！")
+
+        # 2. 设置名称（覆盖父类可能设置的空列表）
+        self.ligand_names = [f"mol_{i}" for i in range(len(self._mols))]
+        
+        # 3. 准备目录
+        self.graph_dir = graph_dir
+        os.makedirs(graph_dir, exist_ok=True)
+        self.optimize = optimize_conformer
+        
+    def _generate_graph_data(self, mol):
+        """生成包含完整特征的图数据"""
+        data = HeteroData()
+        
+        # 1. 处理配体特征
+        # 1. 确保 get_ligand_feature_v1 返回7个值
+        (l_xyz, l_node_feature, l_edge_index, 
+         l_edge_feature, l_full_edge_s, 
+         l_interaction_edge_mask, l_cov_edge_mask) = get_ligand_feature_v1(mol)  # 确保7个变量接收
     
+        # 2. 确保所有特征被正确赋值
+        data['ligand'].xyz = torch.from_numpy(mol.GetConformer().GetPositions()).float()
+        data['ligand'].node_s = l_node_feature.float()  
+        data['ligand'].cov_edge_mask = l_cov_edge_mask  # 确保这个特征被使用
+        data['ligand', 'l2l', 'ligand'].edge_index = l_edge_index
+        data['ligand', 'l2l', 'ligand'].edge_s = l_edge_feature.float()
+        
+        # 2. 合并蛋白质数据
+        data = merge_pro_lig_graph(self.protein_data.clone(), data)
+        data = get_protein_ligand_graph(
+            data,
+            pro_node_num=data['protein'].xyz.size(0),
+            lig_node_num=data['ligand'].xyz.size(0)
+        )
+        
+        return data
+
+    def generate_graphs(self):
+        for idx, mol in enumerate(self._mols):
+            mol_name = self.ligand_names[idx]
+            try:
+                if self.optimize:
+                    mol = mol2conformer_v1(mol)
+                
+                data = self._generate_graph_data(mol)
+                data.pdb_id = mol_name
+                
+                save_path = os.path.join(self.graph_dir, f"{mol_name}.dgl")
+                save_graph(save_path, data)
+                
+            except Exception as e:
+                print(f"处理失败：{mol_name} - {str(e)}")
+                continue
+    
+    def _get_mol(self, idx):
+        """直接返回SDF中的分子，可选是否优化"""
+        mol = self.mols[idx]
+        if self.optimize:
+            return mol2conformer_v1(mol)
+        return mol
+        # 3. 图保存路径
+        self.graph_dir = graph_dir
+        os.makedirs(graph_dir, exist_ok=True)
+        self.optimize = optimize_conformer
+
+    def _single_process(self, idx):
+        """重写单分子处理逻辑"""
+        mol = self.mols[idx]
+        if self.optimize:
+            mol = mol2conformer_v1(mol)
+        data = get_graph_v2(self.protein_data.clone(), mol)
+        data.pdb_id = self.ligand_names[idx]
+        data['ligand'].pos = data['ligand'].xyz  # 确保坐标一致
+        return data
+        
+    def __getitem__(self, idx):
+        try:
+            data = self.merge_complex_graph(idx)
+            if data is None:
+                print(f"⚠️ 空数据: idx={idx}")
+            return data
+        except Exception as e:
+            print(f"❌ 加载失败: idx={idx}, 错误={str(e)}")
+            return None  # 返回 None 会被 PassNoneDataLoader 过滤
 
 def get_repeat_node(src_num, dst_num):
     return torch.arange(src_num, dtype=torch.long).repeat(dst_num), \
@@ -744,6 +890,4 @@ def get_mol2_xyz_from_cmd(ligand_mol2):
     return np.asanyarray(list(zip(x, y, z))).astype(float)
 
 
-if __name__ == '__main__':
-    lig_mol2 = '/root/project_7/data/pretrain_pdbbind/3vjs/3vjs_ligand.mol2'
-    get_mol2_xyz_from_cmd(lig_mol2)
+

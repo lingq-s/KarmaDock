@@ -126,6 +126,7 @@ exclude.list
 *.sdf
 *.pdb
 *.smi
+*.mol2
 *.txt
 *.csv
 data/
@@ -134,3 +135,5 @@ data/
 *.jpeg
 *.bak
 DEKOIS2/
+*.pyc
+*.dgl

@@ -881,13 +881,44 @@ def get_pocker_center_from_cmd(ligand_mol2):
 
 
 def get_mol2_xyz_from_cmd(ligand_mol2):
-    x = os.popen(
-        "cat %s | sed -n '/@<TRIPOS>ATOM/,/@<TRIPOS>BOND/'p | awk '{print $3}'" % ligand_mol2).read().splitlines()[1:-1]
-    y = os.popen(
-        "cat %s | sed -n '/@<TRIPOS>ATOM/,/@<TRIPOS>BOND/'p | awk '{print $4}'" % ligand_mol2).read().splitlines()[1:-1]
-    z = os.popen(
-        "cat %s | sed -n '/@<TRIPOS>ATOM/,/@<TRIPOS>BOND/'p | awk '{print $5}'" % ligand_mol2).read().splitlines()[1:-1]
-    return np.asanyarray(list(zip(x, y, z))).astype(float)
+    coords = []
+    reading_atoms = False
+    
+    try:
+        # mode='r' 会自动处理 Windows/Linux 换行符差异
+        # errors='ignore' 防止极少数编码问题导致崩溃
+        with open(ligand_mol2, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip() # 关键：这一步会把 \r 和 \n 都去掉
+                if not line: 
+                    continue
+                
+                # 状态机逻辑：兼容各种格式的标签
+                if "@<TRIPOS>ATOM" in line:
+                    reading_atoms = True
+                    continue
+                elif line.startswith("@<TRIPOS>") and reading_atoms:
+                    break # 读完原子数据遇到下一个标签（如 UNITY 或 BOND）立刻停止
+                
+                if reading_atoms:
+                    parts = line.split()
+                    # 确保是数据行（排除标签行和空行）
+                    if len(parts) >= 5 and not parts[0].startswith('@'):
+                        try:
+                            x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+                            coords.append([x, y, z])
+                        except ValueError:
+                            continue
+    except Exception as e:
+        raise ValueError(f"Critical Error: Could not read file {ligand_mol2}. Reason: {e}")
+
+    coords_array = np.array(coords)
+
+    if coords_array.size == 0:
+        raise ValueError(f"Critical Error: No coordinates found in {ligand_mol2}. "
+                         f"Please check if the file contains '@<TRIPOS>ATOM'.")
+
+    return coords_array
 
 
 
